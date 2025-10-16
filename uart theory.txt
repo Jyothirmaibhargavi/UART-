@@ -1,0 +1,291 @@
+-------------------------------------------BAUD RATE GENERATOR-------------------------------------
+1. Purpose
+The Baud Rate Generator is a timing block that creates a periodic enable pulse — called baud_tick — used to synchronize data transmission and reception in UART.
+It ensures that bits are sent and sampled at the correct rate (baud rate).
+
+Baud Rate = Number of bits transmitted per second.
+Example: 9600 baud → 9600 bits per second
+
+Since UART is asynchronous, both transmitter (TX) and receiver (RX) depend on this clock tick to stay time-aligned with the data bits.
+
+2. Input and Output
+Signal	Direction	Description
+clk	Input	System clock (e.g., 50 MHz or 100 MHz)
+rst	Input	Asynchronous or synchronous reset
+baud_tick	Output	Single-cycle pulse generated at the baud rate (or 16× baud for oversampling)
+
+3. Role in UART System
+The baudgen is the “heartbeat” of UART.
+All other modules (TX and RX) trigger their internal logic only when baud_tick = 1.
+
+In transmitter (uart_tx):
+On every baud_tick, the next bit (LSB → MSB) is shifted out.
+
+In receiver (uart_rx):
+On every baud_tick, sampling happens — usually 16× faster to detect mid-bit values accurately.
+
+ 4. Oversampling (×16)
+UART receivers typically use 16× oversampling for accurate bit detection.
+That means for each bit duration, the baud generator produces 16 baud_ticks.
+
+So: Baud Tick Frequency = 16×Baud Rate
+         
+Example:
+System clock = 50 MHz
+Desired baud rate = 9600 bps
+Required tick frequency = 16 × 9600 = 153600 Hz
+Divide factor = 50,000,000 / 153,600 ≈ 325
+So, baudgen divides the system clock by 325 to generate 16× baud ticks.
+
+5. Counter-Based Implementation
+To generate the baud_tick, a counter is used:
+The counter increments on every system clock (clk) edge.
+When the counter reaches the divide factor (ticks - 1), it:
+Generates a single-cycle pulse (baud_tick = 1)
+Resets the counter to zero
+Otherwise, the counter simply increments and baud_tick = 0.
+
+------------------------------------------------------UART TRANSMITTER---------------------------------------------------------------------
+1. Purpose
+The UART transmitter module sends 8-bit data serially over a single line (tx_line) using start, data, and stop bits:
+Start bit: 1 bit, always 0, indicates the beginning of transmission.
+Data bits: 8 bits, LSB first.
+Stop bit: 1 bit, always 1, indicates the end of transmission.
+tx_done goes high when transmission of one byte is complete.
+The module uses a baud_tick signal from a baud rate generator (like the one you wrote earlier) for precise timing.
+
+2. Inputs and Outputs
+Signal	Direction	Description
+data_in	Input	8-bit parallel data to transmit
+clk	Input	System clock (e.g., 50 MHz)
+rst	Input	Asynchronous reset
+start_tx	Input	Trigger signal to start transmission
+baud_tick	Input	Timing pulse from baud rate generator (16× oversampling)
+tx_line	Output	Serial data line (drives TX)
+tx_done	Output	High when one byte transmission completes
+
+3. FSM Design (Finite State Machine)
+The module uses a one-hot encoded FSM with 4 states:
+State	Binary	Description
+idle	0001	Line idle (tx_line = 1), waits for start_tx
+start	0010	Sends start bit (0), resets bit_index
+data	0100	Sends 8 data bits LSB first, uses oversampling ticks
+stop	1000	Sends stop bit (1), signals tx_done after 16 baud_ticks
+
+Why FSM?
+UART transmission is sequential: start → data bits → stop.
+FSM makes timing predictable and hardware-friendly.
+
+4. Oversampling Handling
+UART typically uses 16× oversampling:
+tick_counter counts the number of baud_ticks for a single bit.
+Each bit is held for 16 ticks to match the oversampling factor.
+After 16 ticks, the module moves to the next bit (or stop bit).
+
+Example Timing for 9600 baud with 50 MHz clk:
+Each UART bit duration ≈ 104 μs
+16× oversampling → 16 baud_ticks per bit → 104 μs / 16 ≈ 6.5 μs per baud_tick
+tick_counter counts 0 → 15 to hold each bit for 16 ticks.
+
+5. Registers and Counters
+Register	Purpose
+ps / ns	Present / Next state of FSM
+tick_counter	Counts baud_ticks for one bit (0–15)
+bit_index	Counts which data bit is being transmitted (0–7)
+tx_data	Stores the byte to transmit
+
+6. Sequential Logic
+Updates FSM current state on each clock.
+Resets to idle if rst is high.
+
+7. Combinational Next-State Logic
+Moves FSM based on state and inputs.
+Ensures baud_tick timing controls when states transition.
+Prevents changing state too fast (only change on baud_tick).
+
+8. Output Logic
+Idle State:
+tx_line = 1 (idle high)
+If start_tx is asserted:
+Load tx_data = data_in
+Clear tx_done
+
+Start State:
+Drive tx_line = 0 for start bit
+Reset bit_index = 0
+Clear tx_done
+
+Data State:
+On every baud_tick:
+If tick_counter = 0: output current bit
+Increment tick_counter
+When tick_counter = 15 → move to next bit (bit_index++) and reset tick_counter
+Data transmitted LSB first: tx_line <= tx_data[bit_index]
+
+Stop State:
+Drive tx_line = 1 for stop bit
+After 16 ticks → tx_done = 1
+Resets tick_counter for next byte
+
+Default:
+tx_line = 1, tx_done = 1, counters reset
+
+9. Transmission Sequence
+Example for transmitting 0xA5 = 10100101:
+
+Step	tx_line	Tick Count	Note
+Idle	1	-	Waiting for start_tx
+Start	0	0–15	Start bit
+Data 0	1	0–15	LSB first
+Data 1	0	0–15	...
+Data 2	1	0–15	...
+...	...	...	...
+Data 7	1	0–15	MSB
+Stop	1	0–15	Stop bit
+Done	1	-	tx_done = 1
+
+10. Key Points 
+FSM Approach: Makes sequential UART transmission deterministic.
+Oversampling Handling: tick_counter ensures 16× baud_tick per bit.
+LSB First: Standard UART convention.
+tx_done Signal: Indicates completion of byte transmission.
+Start/Stop Bits: Ensure asynchronous communication alignment.
+
+Takeaway:
+This UART transmitter is modular, works with an external baud generator, supports 8-bit data, start/stop framing, and 16× oversampling, making it suitable for robust asynchronous serial communication.
+
+----------------------------------------------------UART RECEIVER-----------------------------------------------------------------------------
+
+1. Purpose
+The UART receiver receives 8-bit serial data over a line (rx) using start, data, and stop bits:
+Start bit: 1 bit, always 0 — indicates the beginning of a frame.
+Data bits: 8 bits, LSB first.
+Stop bit: 1 bit, always 1 — indicates the end of transmission.
+rx_done goes high when one byte is successfully received.
+The received byte is stored in data_out.
+The module uses baud_tick from a baud rate generator (16× oversampling) to accurately sample each bit.
+
+2. Inputs and Outputs
+Signal	Direction	Description
+rx	Input	Serial data line from UART TX
+clk	Input	System clock (e.g., 50 MHz)
+rst	Input	Asynchronous reset
+baud_tick	Input	Timing pulse from baud rate generator (16× oversampling)
+rx_done	Output	High when a complete byte is received
+data_out	Output	8-bit received byte
+
+3. FSM Design
+The receiver uses a one-hot encoded FSM with 4 states:
+
+State	Binary	Description
+idle	0001	Waiting for start bit (rx goes low)
+start	0010	Detecting start bit, waiting for middle of start bit
+data	0100	Sampling 8 data bits using oversampling
+stop	1000	Detecting stop bit, completing reception
+
+Why FSM?
+UART reception is sequential, with bit-level sampling.
+FSM makes timing predictable and hardware-friendly.
+
+4. Oversampling and Tick Counter
+16× oversampling is used for reliable mid-bit detection.
+tick_counter counts baud_ticks (0–15) for each bit.
+Middle of the bit: The bit is sampled at tick_counter = 7.
+Sampling in the middle reduces error due to slight clock mismatches between TX and RX.
+After 16 ticks, the FSM moves to the next bit or state.
+
+5. Registers and Counters
+Register	Purpose
+ps / ns	Present / Next FSM state
+tick_counter	Counts baud_ticks for one bit (0–15)
+bit_index	Counts which data bit is being received (0–7)
+rx_data	Temporary storage for received byte
+
+
+6. Sequential Logic – State Update
+FSM state updates on each clock edge.
+Resets to idle if rst is high.
+
+7. Combinational Next-State Logic
+Detects start bit when rx goes low.
+Moves from start → data → stop → idle based on tick_counter and bit_index.
+Ensures bit sampling occurs at mid-bit (tick_counter=7).
+
+
+8. Output Logic
+Idle State:
+Waits for start bit (rx=0).
+Resets counters and clears rx_done.
+
+Start State:
+Increments tick_counter on each baud_tick.
+Sample the start bit at tick_counter = 7 (middle of start bit).
+After sampling, reset tick_counter and move to data state.
+
+Data State:
+On every baud_tick:
+If tick_counter = 7 → sample current data bit and store in rx_data[bit_index]
+tick_counter continues until 15 → then increment bit_index to move to next bit.
+Repeat until all 8 bits are received.
+
+Stop State:
+On tick_counter = 7, store received byte from rx_data into data_out.
+Set rx_done = 1 to indicate byte reception complete.
+Reset counters, then return to idle.
+
+9. Reception Sequence
+Example for receiving 0xA5 = 10100101:
+
+Step	rx	Tick Count	Note
+Idle	1	-	Waiting for start bit
+Start	0	0–15	Sample start at tick=7
+Data 0	1	0–15	LSB first
+Data 1	0	0–15	...
+Data 2	1	0–15	...
+...	...	...	...
+Data 7	1	0–15	MSB
+Stop	1	0–15	Stop bit, rx_done=1
+
+10. Key Points
+Mid-bit sampling ensures robust reception despite asynchronous clocks.
+FSM ensures sequential control of start, data, and stop bits.
+tick_counter handles 16× oversampling for each bit.
+rx_done indicates successful byte reception.
+LSB first is standard UART convention.
+
+Takeaway:
+The UART receiver uses oversampling, FSM, and counters to reliably sample incoming serial data, extract bytes, and signal completion with rx_done. Together with uart_tx and baudgen, it forms a full UART communication system.
+
+
+-------------------------------------------------------CONCULUSION--------------------------------------------------------------------------
+Conclusion – UART Protocol
+
+The Universal Asynchronous Receiver/Transmitter (UART) protocol is a simple, widely used method for asynchronous serial communication. It allows two devices to exchange data bit by bit over a single data line without a shared clock, making it hardware-efficient and flexible.
+
+Key points:
+Asynchronous Communication:
+UART does not require a shared clock.
+Timing is maintained using a baud rate generator, ensuring accurate transmission and reception.
+
+Framing Structure:
+Each byte is transmitted with a start bit, 8 data bits (LSB first), and stop bit(s).
+Optional parity bits can be added for error detection.
+
+Oversampling for Accuracy:
+UART receivers often use 16× oversampling to reliably sample each bit at its midpoint, reducing errors due to clock differences or noise.
+
+Modular Implementation:
+Hardware modules typically include:
+
+Baud Rate Generator: Produces precise timing pulses.
+
+Transmitter (UART_TX): Shifts data out serially on each baud tick.
+
+Receiver (UART_RX): Samples incoming data serially and reconstructs bytes.
+
+Applications:
+UART is used in microcontrollers, embedded systems, computers, and peripherals for low-speed serial communication.
+It is simple to implement and requires minimal pins.
+
+In essence:
+UART is a reliable, low-cost, and efficient protocol for serial communication, enabling accurate data transfer between devices through carefultiming, framing, and oversampling mechanisms. Its simplicity and robustness make it a cornerstone of embedded and digital communication systems.
